@@ -826,8 +826,11 @@ impl VllmPDRouter {
             let (base, rank) = dp_utils::parse_worker_url(&address);
             let dp_size = match self.kv_connector {
                 // Respect an explicit registration, including an explicit
-                // single-rank size. Preserve the legacy single-rank MoRI-IO default.
-                KvConnector::MoriIO => registered_dp_size.unwrap_or(1).max(1),
+                // single-rank size.  An explicit intra-node size is a
+                // reachability cap for MoRI-IO: a multi-node DP group can
+                // register its global size while only the master's local
+                // ranks expose HTTP/KV transfer endpoints.
+                KvConnector::MoriIO => self.moriio_routable_dp_size(registered_dp_size),
                 _ => registered_dp_size
                     .unwrap_or(1)
                     .max(self.intra_node_data_parallel_size)
@@ -858,6 +861,19 @@ impl VllmPDRouter {
             }
         }
         workers
+    }
+
+    /// Return the MoRI-IO DP size that is reachable through a registered
+    /// master.  Preserve the registered size unless the operator explicitly
+    /// configured a multi-rank intra-node group, which is the legacy routing
+    /// contract for headless child nodes.
+    fn moriio_routable_dp_size(&self, registered_dp_size: Option<usize>) -> usize {
+        let registered_dp_size = registered_dp_size.unwrap_or(1).max(1);
+        if self.intra_node_data_parallel_size > 1 {
+            registered_dp_size.min(self.intra_node_data_parallel_size)
+        } else {
+            registered_dp_size
+        }
     }
 
     /// Stable session identity for the optional kv_aware decode binding.
@@ -2615,6 +2631,12 @@ mod tests {
             policy: crate::config::PolicyConfig::RoundRobin,
             ..Default::default()
         };
+        test_vllm_pd_router_with_config(config).await
+    }
+
+    async fn test_vllm_pd_router_with_config(
+        config: crate::config::RouterConfig,
+    ) -> VllmPDRouter {
         let ctx = Arc::new(
             crate::server::AppContext::new(config, reqwest::Client::new(), 64, None, vec![])
                 .unwrap(),
@@ -4229,6 +4251,115 @@ mod tests {
         // Verify the KvConnector::Nixl variant exists and is the default.
         let connector = KvConnector::default();
         assert_eq!(connector, KvConnector::Nixl);
+    }
+
+    #[tokio::test]
+    async fn moriio_intra_node_dp_size_caps_registered_dp_workers_and_params() {
+        let router = test_vllm_pd_router_with_config(crate::config::RouterConfig {
+            kv_connector: KvConnector::MoriIO,
+            intra_node_data_parallel_size: 8,
+            ..Default::default()
+        })
+        .await;
+        let decode_workers = router.discovery_candidates(
+            vec![("http://decode:20005".into(), String::new(), Some(16))],
+            ServiceType::Decode,
+        );
+        assert_eq!(decode_workers.len(), 8);
+        assert_eq!(
+            decode_workers
+                .iter()
+                .map(|worker| worker.dp_rank())
+                .collect::<Vec<_>>(),
+            (0..8).map(Some).collect::<Vec<_>>()
+        );
+        assert!(decode_workers.iter().all(|worker| worker.dp_size() == Some(8)));
+
+        router
+            .service_registry
+            .moriio_transfer_mode
+            .set(MoriIOTransferMode::Write)
+            .unwrap();
+        let prefill_params = router
+            .build_prefill_kv_transfer_params(
+                Some("tx-test"),
+                Some("http://decode:20005"),
+                decode_workers[0].dp_size(),
+                decode_workers[0].dp_rank(),
+            )
+            .unwrap();
+        assert_eq!(prefill_params["remote_dp_size"], 8);
+        let decode_params = router
+            .build_decode_kv_transfer_params(
+                "http://prefill:20005",
+                None,
+                Some("tx-test"),
+                Some(8),
+                Some(0),
+                Some("request"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(decode_params["remote_dp_size"], 8);
+
+        let read_router = test_vllm_pd_router_with_config(crate::config::RouterConfig {
+            kv_connector: KvConnector::MoriIO,
+            intra_node_data_parallel_size: 8,
+            ..Default::default()
+        })
+        .await;
+        read_router
+            .service_registry
+            .moriio_transfer_mode
+            .set(MoriIOTransferMode::Read)
+            .unwrap();
+        let read_prefill_params = read_router
+            .build_prefill_kv_transfer_params(Some("tx-test"), None, Some(8), None)
+            .unwrap();
+        assert_eq!(read_prefill_params["remote_dp_size"], 8);
+        let read_decode_params = read_router
+            .build_decode_kv_transfer_params(
+                "http://prefill:20005",
+                Some(&json!({"kv_transfer_params": {}})),
+                Some("tx-test"),
+                Some(8),
+                Some(0),
+                Some("request"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read_decode_params["remote_dp_size"], 8);
+    }
+
+    #[tokio::test]
+    async fn moriio_registered_dp_size_is_preserved_without_intra_node_cap() {
+        let router = test_vllm_pd_router_with_config(crate::config::RouterConfig {
+            kv_connector: KvConnector::MoriIO,
+            intra_node_data_parallel_size: 1,
+            ..Default::default()
+        })
+        .await;
+        let decode_workers = router.discovery_candidates(
+            vec![("http://decode:20005".into(), String::new(), Some(16))],
+            ServiceType::Decode,
+        );
+        assert_eq!(decode_workers.len(), 16);
+        assert!(decode_workers.iter().all(|worker| worker.dp_size() == Some(16)));
+
+        router
+            .service_registry
+            .moriio_transfer_mode
+            .set(MoriIOTransferMode::Write)
+            .unwrap();
+        let params = router
+            .build_prefill_kv_transfer_params(
+                Some("tx-test"),
+                Some("http://decode:20005"),
+                decode_workers[0].dp_size(),
+                decode_workers[0].dp_rank(),
+            )
+            .unwrap();
+        assert_eq!(params["remote_dp_size"], 16);
     }
 
     // --- MoRI-IO WRITE mode parameter tests ---
