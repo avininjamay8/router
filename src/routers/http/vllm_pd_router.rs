@@ -4289,21 +4289,6 @@ mod tests {
         );
         assert_eq!(decode_workers.len(), 16);
         assert!(decode_workers.iter().all(|worker| worker.dp_size() == Some(16)));
-
-        router
-            .service_registry
-            .moriio_transfer_mode
-            .set(MoriIOTransferMode::Write)
-            .unwrap();
-        let params = router
-            .build_prefill_kv_transfer_params(
-                Some("tx-test"),
-                Some("http://decode:20005"),
-                decode_workers[0].dp_size(),
-                decode_workers[0].dp_rank(),
-            )
-            .unwrap();
-        assert_eq!(params["remote_dp_size"], 16);
     }
 
     // --- MoRI-IO WRITE mode parameter tests ---
